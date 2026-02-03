@@ -2,9 +2,14 @@ import logging
 import json
 import os
 import azure.functions as func
-import pyodbc
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
+from sqlalchemy import create_engine, Column, Integer, String, Float
+from sqlalchemy.orm import declarative_base, sessionmaker, Session
+from dotenv import load_dotenv
+import urllib.parse
+
+load_dotenv()
 
 # -------------------------
 # Azure Function App
@@ -12,7 +17,60 @@ from typing import Optional
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 
 # -------------------------
-# Data Model
+# Database Configuration
+# -------------------------
+AZURE_SQL_SERVER = os.getenv("AZURE_SQL_SERVER")
+AZURE_SQL_DATABASE = os.getenv("AZURE_SQL_DATABASE")
+AZURE_SQL_USERNAME = os.getenv("AZURE_SQL_USERNAME")
+AZURE_SQL_PASSWORD = os.getenv("AZURE_SQL_PASSWORD")
+
+# print(AZURE_SQL_SERVER, AZURE_SQL_DATABASE, AZURE_SQL_USERNAME, AZURE_SQL_PASSWORD)
+
+if not all([
+    AZURE_SQL_SERVER,
+    AZURE_SQL_DATABASE,
+    AZURE_SQL_USERNAME,
+    AZURE_SQL_PASSWORD
+]):
+    raise ValueError("Database configuration is incomplete")
+
+AZURE_SQL_PASSWORD = urllib.parse.quote_plus(AZURE_SQL_PASSWORD)
+driver = "ODBC Driver 17 for SQL Server"
+
+CONNECTION_STRING =  f"mssql+pyodbc://{AZURE_SQL_USERNAME}:{AZURE_SQL_PASSWORD}@{AZURE_SQL_SERVER}:1433/{AZURE_SQL_DATABASE}?driver={driver.replace(' ', '+')}&encrypt=yes&trustServerCertificate=yes"
+
+# ----------------------------
+# SQLAlchemy Setup
+# ----------------------------
+engine = create_engine(
+    CONNECTION_STRING,
+    pool_pre_ping=True,
+    future=True
+)
+
+SessionLocal = sessionmaker(
+    bind=engine,
+    autoflush=False,
+    autocommit=False
+)
+
+Base = declarative_base()
+
+# -------------------------
+# ORM Model
+# -------------------------
+class EmployeeORM(Base):
+    __tablename__ = "employees"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(100), nullable=False)
+    department = Column(String(100), nullable=False)
+    salary = Column(Float, nullable=False)
+
+Base.metadata.create_all(bind=engine)
+
+# -------------------------
+# Pydantic Model
 # -------------------------
 class Employee(BaseModel):
     id: Optional[int] = None
@@ -20,113 +78,108 @@ class Employee(BaseModel):
     department: str
     salary: float
 
-# -------------------------
-# Database helper
-# -------------------------
-def get_db_connection():
-    SERVER = os.getenv("SQL_SERVER")
-    DATABASE = os.getenv("SQL_DATABASE")
-    USERNAME = os.getenv("SQL_USERNAME")
-    PASSWORD = os.getenv("SQL_PASSWORD")
-    DRIVER = "{ODBC Driver 17 for SQL Server}"  # <- Azure Linux 支援 Driver 17
+    model_config = {
+        "from_attributes": True
+    }        
 
-    if not all([SERVER, DATABASE, USERNAME, PASSWORD]):
-        raise ValueError("Database configuration is incomplete")
-
-    conn_str = (
-        f"DRIVER={DRIVER};"
-        f"SERVER={SERVER};"
-        f"DATABASE={DATABASE};"
-        f"UID={USERNAME};"
-        f"PWD={PASSWORD};"
-        f"Encrypt=yes;"
-        f"TrustServerCertificate=yes;"
-        f"Connection Timeout=30;"
-    )
-
-    return pyodbc.connect(conn_str)
+# ----------------------------
+# Database Dependency
+# ----------------------------
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 # -------------------------
 # HTTP Trigger
 # -------------------------
 @app.route(
+    route="TEST",
+    methods=["GET", "POST", "PUT", "DELETE"],
+    auth_level=func.AuthLevel.ANONYMOUS,
+)
+@app.function_name(name="get_environment_variable")
+def get_environment_variable(req: func.HttpRequest) -> func.HttpResponse:
+    return func.HttpResponse(json.dumps({"AZURE_SQL_SERVER": AZURE_SQL_SERVER, "AZURE_SQL_DATABASE": AZURE_SQL_DATABASE, "AZURE_SQL_USERNAME": AZURE_SQL_USERNAME, "AZURE_SQL_PASSWORD": AZURE_SQL_PASSWORD}), status_code=200, mimetype="application/json")
+
+@app.route(
     route="employee",
     methods=["GET", "POST", "PUT", "DELETE"],
     auth_level=func.AuthLevel.ANONYMOUS
 )
+@app.function_name(name="employee_api")
 def employee_api(req: func.HttpRequest) -> func.HttpResponse:
     logging.info("Employee CRUD function triggered")
 
-    # 建立 DB 連線
     try:
-        conn = get_db_connection()
+        db: Session = next(get_db())
     except Exception as e:
-        logging.exception("DB connection failed")
+        logging.error(f"Database connection error: {e}")
         return func.HttpResponse(
-            json.dumps({"error": str(e), "type": type(e).__name__}),
+            json.dumps({"error": "Database connection error", "details": str(e)}),
             status_code=500,
             mimetype="application/json"
         )
-
+    
     method = req.method
-
+    
     try:
         body = req.get_json()
     except ValueError:
-        body = {}
+        body = None
 
     # -------------------------
     # CREATE (POST)
     # -------------------------
     if method == "POST":
         try:
+            # emp = Employee(**body)
+            # new_emp = EmployeeORM(
+            #     name=emp.name,
+            #     department=emp.department,
+            #     salary=emp.salary
+            # )
             emp = Employee(**body)
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    "INSERT INTO Employees (name, department, salary) VALUES (?, ?, ?)",
-                    emp.name, emp.department, emp.salary
-                )
-                conn.commit()
+            new_emp = EmployeeORM(**emp.dict())
+            db.add(new_emp)
+            db.commit()
             return func.HttpResponse(
                 json.dumps({"message": "Employee created successfully"}),
                 status_code=201,
                 mimetype="application/json"
             )
         except Exception as e:
+            db.rollback()
             logging.exception("POST failed")
             return func.HttpResponse(
                 json.dumps({"error": str(e)}),
                 status_code=400,
                 mimetype="application/json"
             )
-
     # -------------------------
     # READ (GET)
     # -------------------------
     if method == "GET":
         emp_id = req.params.get("id")
+        
         try:
-            with conn.cursor() as cursor:
-                if emp_id:
-                    cursor.execute("SELECT * FROM Employees WHERE id = ?", emp_id)
-                    row = cursor.fetchone()
-                    if not row:
-                        return func.HttpResponse("Employee not found", status_code=404)
-                    employee = {
-                        "id": row.id,
-                        "name": row.name,
-                        "department": row.department,
-                        "salary": row.salary
-                    }
-                    return func.HttpResponse(json.dumps(employee), mimetype="application/json")
-                else:
-                    cursor.execute("SELECT * FROM Employees")
-                    rows = cursor.fetchall()
-                    employees = [
-                        {"id": r.id, "name": r.name, "department": r.department, "salary": r.salary}
-                        for r in rows
-                    ]
-                    return func.HttpResponse(json.dumps(employees), mimetype="application/json")
+            if emp_id:
+                employee = db.query(EmployeeORM).filter(EmployeeORM.id == emp_id).first()
+                if not employee:
+                    return func.HttpResponse(json.dumps({"error": "Employee not found"}), status_code=404, mimetype="application/json")
+                return func.HttpResponse(
+                    json.dumps(Employee.from_orm(employee).dict()),
+                    mimetype="application/json"
+                )
+            employees = db.query(EmployeeORM).all()
+            result = [Employee.from_orm(emp).dict() for emp in employees]
+
+            return func.HttpResponse(
+                json.dumps(result),
+                mimetype="application/json"
+            )
         except Exception as e:
             logging.exception("GET failed")
             return func.HttpResponse(
@@ -134,54 +187,87 @@ def employee_api(req: func.HttpRequest) -> func.HttpResponse:
                 status_code=500,
                 mimetype="application/json"
             )
-
+        
     # -------------------------
     # UPDATE (PUT)
     # -------------------------
     if method == "PUT":
         try:
             emp = Employee(**body)
+
             if emp.id is None:
-                return func.HttpResponse("Employee id is required", status_code=400)
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    "UPDATE Employees SET name=?, department=?, salary=? WHERE id=?",
-                    emp.name, emp.department, emp.salary, emp.id
+                return func.HttpResponse(
+                    json.dumps({"error": "Employee id is required"}),
+                    status_code=400,
+                    mimetype="application/json"
                 )
-                conn.commit()
+            
+            employee = db.query(EmployeeORM).filter(EmployeeORM.id == emp.id).first()
+            
+            if not employee:
+                return func.HttpResponse(
+                    json.dumps({"error": "Employee not found"}),
+                    status_code=404,
+                    mimetype="application/json"
+                )
+            
+            employee.name = emp.name
+            employee.department = emp.department
+            employee.salary = emp.salary
+            db.commit()
+            db.refresh(employee)
             return func.HttpResponse(
                 json.dumps({"message": "Employee updated successfully"}),
                 mimetype="application/json"
             )
+        
         except Exception as e:
+            db.rollback()
             logging.exception("PUT failed")
             return func.HttpResponse(
                 json.dumps({"error": str(e)}),
                 status_code=400,
                 mimetype="application/json"
             )
-
     # -------------------------
     # DELETE (DELETE)
     # -------------------------
     if method == "DELETE":
         emp_id = req.params.get("id")
+
         if not emp_id:
-            return func.HttpResponse("Employee id is required", status_code=400)
-        try:
-            with conn.cursor() as cursor:
-                cursor.execute("DELETE FROM Employees WHERE id = ?", emp_id)
-                conn.commit()
             return func.HttpResponse(
-                json.dumps({"message": f"Employee {emp_id} deleted successfully"}),
+                json.dumps({"error": "Employee id is required"}),
+                status_code=400,
                 mimetype="application/json"
             )
+        
+        try:
+            employee = db.query(EmployeeORM).filter(
+                EmployeeORM.id == emp_id
+            ).first()
+
+            if not employee:
+                return func.HttpResponse(
+                    json.dumps({"error": "Employee not found"}),
+                    status_code=404,
+                    miimetype="application/json"
+                )
+            
+            db.delete(employee)
+            db.commit()
+            return func.HttpResponse(
+                json.dumps({"message": "Employee deleted successfully"}),
+                mimetype="application/json"
+            )
+        
         except Exception as e:
+            db.rollback()
             logging.exception("DELETE failed")
             return func.HttpResponse(
                 json.dumps({"error": str(e)}),
                 status_code=500,
                 mimetype="application/json"
             )
-
+        
     return func.HttpResponse("Method not allowed", status_code=405)
